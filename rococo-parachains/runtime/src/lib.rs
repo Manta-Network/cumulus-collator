@@ -74,13 +74,12 @@ pub use primitives::{Amount, CurrencyId, TokenSymbol};
 
 // ORML imports
 use orml_currencies::BasicCurrencyAdapter;
-use orml_xcm_support::{
-	CurrencyIdConverter, IsConcreteWithGeneralKey, MultiCurrencyAdapter, XcmHandler as XcmHandlerT,
-};
+use orml_xcm_support::{IsNativeConcrete, MultiCurrencyAdapter, XcmHandler as XcmHandlerT};
 
 // XCM imports
 use polkadot_parachain::primitives::Sibling;
-use xcm::v0::{Junction, MultiLocation, NetworkId, Xcm};
+use xcm::v0::{Junction, MultiLocation::{self, X2},
+ NetworkId, Xcm};
 use xcm_builder::{
 	AccountId32Aliases, LocationInverter, ParentIsDefault, RelayChainAsNative,
 	SiblingParachainAsNative, SiblingParachainConvertsVia, SignedAccountId32AsNative,
@@ -291,11 +290,11 @@ type LocalOriginConverter = (
 pub type LocalAssetTransactor = MultiCurrencyAdapter<
 	Currencies,
 	UnknownTokens,
-	IsConcreteWithGeneralKey<CurrencyId, Identity>,
-	LocationConverter,
+	IsNativeConcrete<CurrencyId, Identity>,
 	AccountId,
-	CurrencyIdConverter<CurrencyId, RelayChainCurrencyId>,
+	LocationConverter,
 	CurrencyId,
+	CurrencyIdConverter<CurrencyId, RelayChainCurrencyId>,	
 >;
 
 pub struct XcmConfig;
@@ -382,14 +381,17 @@ impl orml_currencies::Config for Runtime {
 	type WeightInfo = ();
 }
 
+parameter_types! {
+	pub SelfLocation: MultiLocation = X2(Parent, Parachain { id: ParachainInfo::get().into() });
+}
+
 impl orml_xtokens::Config for Runtime {
 	type Event = Event;
 	type Balance = Balance;
-	type ToRelayChainBalance = Identity;
 	type AccountId32Convert = AccountId32Convert;
 	//TODO: change network id if kusama
-	type RelayChainNetworkId = PolkadotNetworkId;
-	type ParaId = ParachainInfo;
+	type SelfLocation = SelfLocation;
+	type CurrencyId =  CurrencyId;
 	type XcmHandler = HandleXcm;
 }
 
