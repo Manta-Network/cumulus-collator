@@ -35,7 +35,7 @@ use sp_runtime::{
 	create_runtime_str, generic, impl_opaque_keys,
 	traits::{
 		AccountIdConversion, BlakeTwo256, Block as BlockT,
-		Convert, Identity, IdentityLookup, 
+		Convert, IdentityLookup,
 	},
 	transaction_validity::{TransactionSource, TransactionValidity},
 	ApplyExtrinsicResult, DispatchResult, ModuleId,
@@ -44,6 +44,7 @@ use sp_std::prelude::*;
 #[cfg(feature = "std")]
 use sp_version::NativeVersion;
 use sp_version::RuntimeVersion;
+use codec::{Decode, Encode};
 
 /// Weights for pallets used in the runtime
 mod weights;
@@ -51,7 +52,7 @@ mod weights;
 // A few exports that help ease life for downstream crates.
 pub use frame_support::{
 	construct_runtime, parameter_types,
-	traits::Randomness,
+	traits::{ Randomness, Get},
 	weights::{
 		constants::{BlockExecutionWeight, ExtrinsicBaseWeight, RocksDbWeight, WEIGHT_PER_SECOND},
 		DispatchClass, IdentityFee, Weight,
@@ -78,8 +79,11 @@ use orml_xcm_support::{IsNativeConcrete, MultiCurrencyAdapter, XcmHandler as Xcm
 
 // XCM imports
 use polkadot_parachain::primitives::Sibling;
-use xcm::v0::{Junction, MultiLocation::{self, X2},
- NetworkId, Xcm};
+use cumulus_primitives_core::ParaId;
+use xcm::v0::{
+	Junction::{self, GeneralKey, Parachain, Parent},
+	MultiLocation::{self, X1, X2, X3},
+ 	MultiAsset, NetworkId, Xcm};
 use xcm_builder::{
 	AccountId32Aliases, LocationInverter, ParentIsDefault, RelayChainAsNative,
 	SiblingParachainAsNative, SiblingParachainConvertsVia, SignedAccountId32AsNative,
@@ -287,14 +291,70 @@ type LocalOriginConverter = (
 	SignedAccountId32AsNative<RococoNetwork, Origin>,
 );
 
+/// CurrencyId converter
+
+//TODO: use token registry currency type encoding
+fn native_currency_location(id: CurrencyId) -> MultiLocation {
+	X3(
+		Parent,
+		Parachain {
+			id: ParachainInfo::get().into(),
+		},
+		GeneralKey(id.encode()),
+	)
+}
+pub struct CurrencyIdConvert;
+impl Convert<CurrencyId, Option<MultiLocation>> for CurrencyIdConvert {
+	fn convert(id: CurrencyId) -> Option<MultiLocation> {
+		use CurrencyId::Token;
+		use TokenSymbol::*;
+		match id {
+			Token(DOT) => Some(X1(Parent)),
+			Token(MA) => Some(native_currency_location(id)),
+			_ => None,
+		}
+	}
+}
+impl Convert<MultiLocation, Option<CurrencyId>> for CurrencyIdConvert {
+	fn convert(location: MultiLocation) -> Option<CurrencyId> {
+		use CurrencyId::Token;
+		use TokenSymbol::*;
+		match location {
+			X1(Parent) => Some(Token(DOT)),
+			X3(Parent, Parachain { id }, GeneralKey(key)) if ParaId::from(id) == ParachainInfo::get() => {
+				// decode the general key
+				if let Ok(currency_id) = CurrencyId::decode(&mut &key[..]) {
+					// check `currency_id` is cross-chain asset
+					match currency_id {
+						Token(MA) => Some(currency_id),
+						_ => None,
+					}
+				} else {
+					None
+				}
+			}
+			_ => None,
+		}
+	}
+}
+impl Convert<MultiAsset, Option<CurrencyId>> for CurrencyIdConvert {
+	fn convert(asset: MultiAsset) -> Option<CurrencyId> {
+		if let MultiAsset::ConcreteFungible { id, amount: _ } = asset {
+			Self::convert(id)
+		} else {
+			None
+		}
+	}
+}
+
 pub type LocalAssetTransactor = MultiCurrencyAdapter<
 	Currencies,
 	UnknownTokens,
-	IsNativeConcrete<CurrencyId, Identity>,
+	IsNativeConcrete<CurrencyId, CurrencyIdConvert>,
 	AccountId,
 	LocationConverter,
 	CurrencyId,
-	CurrencyIdConverter<CurrencyId, RelayChainCurrencyId>,	
+	CurrencyIdConvert,	
 >;
 
 pub struct XcmConfig;
@@ -389,9 +449,9 @@ impl orml_xtokens::Config for Runtime {
 	type Event = Event;
 	type Balance = Balance;
 	type AccountId32Convert = AccountId32Convert;
-	//TODO: change network id if kusama
 	type SelfLocation = SelfLocation;
 	type CurrencyId =  CurrencyId;
+	type CurrencyIdConvert = CurrencyIdConvert;
 	type XcmHandler = HandleXcm;
 }
 

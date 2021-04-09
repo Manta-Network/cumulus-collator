@@ -60,7 +60,11 @@ substrate-wasm-builder = "3.0.0"
 default = [ "std" ]
 std = [
 	"codec/std",
+	"orml-currencies/std",
 	"orml-traits/std",
+	"orml-tokens/std",
+	"orml-unknown-tokens/std",
+	"orml-xcm-support/std",
 	"serde",
 	"sp-api/std",
 	"sp-std/std",
