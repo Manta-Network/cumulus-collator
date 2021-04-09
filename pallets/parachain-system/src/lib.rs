@@ -30,9 +30,9 @@
 use cumulus_primitives_core::{
 	relay_chain,
 	well_known_keys::{self, NEW_VALIDATION_CODE},
-	AbridgedHostConfiguration, DownwardMessageHandler, HrmpMessageHandler, HrmpMessageSender,
+	AbridgedHostConfiguration, DownwardMessageHandler, XcmpMessageHandler, XcmpMessageSender,
 	InboundDownwardMessage, InboundHrmpMessage, OnValidationData, OutboundHrmpMessage, ParaId,
-	PersistedValidationData, UpwardMessage, UpwardMessageSender,
+	PersistedValidationData, UpwardMessage, UpwardMessageSender, MessageSendError, ServiceQuality,
 };
 use cumulus_primitives_parachain_inherent::ParachainInherentData;
 use frame_support::{
@@ -48,13 +48,24 @@ use relay_state_snapshot::MessagingStateSnapshot;
 use sp_inherents::{InherentData, InherentIdentifier, ProvideInherent};
 use sp_runtime::traits::{BlakeTwo256, Hash};
 use sp_std::{cmp, collections::btree_map::BTreeMap, vec::Vec};
+use codec::{Encode, Decode};
+use xcm::VersionedXcm;
 
 mod relay_state_snapshot;
 #[macro_use]
 pub mod validate_block;
 
+/// The aggregate HMP message format.
+#[derive(PartialEq, Eq, Copy, Clone, Encode, Decode)]
+pub enum AggregateFormat {
+	/// Encoded `VersionedXcm` messages, all concatenated.
+	ConcatenatedVersionedXcm,
+	/// Encoded `VersionedXcm` messages, encoded again, and then concatenated.
+	ConcatenatedEncodedBlob,
+}
+
 /// The pallet's configuration trait.
-pub trait Config: frame_system::Config {
+pub trait Config: frame_system::Config<OnSetCode = ParachainSetCode<Self>> {
 	/// The overarching event type.
 	type Event: From<Event> + Into<<Self as frame_system::Config>::Event>;
 
@@ -71,16 +82,22 @@ pub trait Config: frame_system::Config {
 	///
 	/// The messages are dispatched in the order they were relayed by the relay chain. If multiple
 	/// messages were relayed at one block, these will be dispatched in ascending order of the sender's para ID.
-	type HrmpMessageHandlers: HrmpMessageHandler;
+	type XcmpMessageHandlers: XcmpMessageHandler;
 }
 
 // This pallet's storage items.
 decl_storage! {
 	trait Store for Module<T: Config> as ParachainSystem {
-		// we need to store the new validation function for the span between
-		// setting it and applying it.
-		PendingValidationFunction get(fn new_validation_function):
-			Option<(RelayChainBlockNumber, Vec<u8>)>;
+		/// We need to store the new validation function for the span between
+		/// setting it and applying it. If it has a
+		/// value, then [`PendingValidationFunction`] must have a real value, and
+		/// together will coordinate the block number where the upgrade will happen.
+		PendingRelayChainBlockNumber: Option<RelayChainBlockNumber>;
+
+		/// The new validation function we will upgrade to when the relay chain
+		/// reaches [`PendingRelayChainBlockNumber`]. A real validation function must
+		/// exist here as long as [`PendingRelayChainBlockNumber`] is set.
+		PendingValidationFunction get(fn new_validation_function): Vec<u8>;
 
 		/// The [`PersistedValidationData`] set for this block.
 		ValidationData get(fn validation_data): Option<PersistedValidationData>;
@@ -126,7 +143,7 @@ decl_storage! {
 		/// present in this vector then `OutboundHrmpMessages` for it should be not empty.
 		NonEmptyHrmpChannels: Vec<ParaId>;
 		/// The number of HRMP messages we observed in `on_initialize` and thus used that number for
-		/// announcing the weight of `on_initialize` and `on_finialize`.
+		/// announcing the weight of `on_initialize` and `on_finalize`.
 		AnnouncedHrmpMessagesPerCandidate: u32;
 	}
 }
@@ -138,21 +155,19 @@ decl_module! {
 		// this is needed only if you are using events in your pallet
 		fn deposit_event() = default;
 
-		// TODO: figure out a better weight than this
-		#[weight = (0, DispatchClass::Operational)]
-		pub fn schedule_upgrade(origin, validation_function: Vec<u8>) {
-			ensure_root(origin)?;
-			Self::schedule_upgrade_impl(validation_function)?;
-		}
-
-		/// Schedule a validation function upgrade without further checks.
+		/// Force an already scheduled validation function upgrade to happen on a particular block.
 		///
-		/// Same as [`Module::schedule_upgrade`], but without checking that the new `validation_function`
-		/// is correct. This makes it more flexible, but also opens the door to easily brick the chain.
+		/// Note that coordinating this block for the upgrade has to happen independently on the relay
+		/// chain and this parachain. Synchronizing the block for the upgrade is sensitive, and this
+		/// bypasses all checks and and normal protocols. Very easy to brick your chain if done wrong.
 		#[weight = (0, DispatchClass::Operational)]
-		pub fn schedule_upgrade_without_checks(origin, validation_function: Vec<u8>) {
+		pub fn set_upgrade_block(origin, relay_chain_block: RelayChainBlockNumber) {
 			ensure_root(origin)?;
-			Self::schedule_upgrade_impl(validation_function)?;
+			if let Some(_old_block) = PendingRelayChainBlockNumber::get() {
+				PendingRelayChainBlockNumber::put(relay_chain_block);
+			} else {
+				return Err(Error::<T>::NotScheduled.into())
+			}
 		}
 
 		/// Set the current validation data.
@@ -184,9 +199,10 @@ decl_module! {
 			// initialization logic: we know that this runs exactly once every block,
 			// which means we can put the initialization logic here to remove the
 			// sequencing problem.
-			if let Some((apply_block, validation_function)) = PendingValidationFunction::get() {
+			if let Some(apply_block) = PendingRelayChainBlockNumber::get() {
 				if vfp.relay_parent_number >= apply_block {
-					PendingValidationFunction::kill();
+					PendingRelayChainBlockNumber::kill();
+					let validation_function = PendingValidationFunction::take();
 					LastUpgrade::put(&apply_block);
 					Self::put_parachain_code(&validation_function);
 					Self::deposit_event(Event::ValidationFunctionApplied(vfp.relay_parent_number));
@@ -229,18 +245,34 @@ decl_module! {
 		}
 
 		#[weight = (1_000, DispatchClass::Operational)]
-		fn sudo_send_hrmp_message(origin, message: OutboundHrmpMessage) {
+		fn sudo_send_hmp_xcm(origin, recipient: ParaId, xcm: VersionedXcm, qos: ServiceQuality) {
 			ensure_root(origin)?;
-			let _ = Self::send_hrmp_message(message);
+			let _ = Self::send_xcm_message(recipient, xcm, qos);
+		}
+
+		#[weight = (1_000, DispatchClass::Operational)]
+		fn sudo_send_hmp_blob(origin, recipient: ParaId, blob: Vec<u8>, qos: ServiceQuality) {
+			ensure_root(origin)?;
+			let _ = Self::send_blob_message(recipient, blob, qos);
 		}
 
 		fn on_finalize() {
-			DidSetValidationCode::take();
+			DidSetValidationCode::kill();
 
-			let host_config = Self::host_configuration()
-				.expect("host configuration is promised to set until `on_finalize`; qed");
-			let relevant_messaging_state = Self::relevant_messaging_state()
-				.expect("relevant messaging state is promised to be set until `on_finalize`; qed");
+			let host_config = match Self::host_configuration() {
+				Some(ok) => ok,
+				None => {
+					debug_assert!(false, "host configuration is promised to set until `on_finalize`; qed");
+					return
+				}
+			};
+			let relevant_messaging_state = match Self::relevant_messaging_state() {
+				Some(ok) => ok,
+				None => {
+					debug_assert!(false, "relevant messaging state is promised to be set until `on_finalize`; qed");
+					return
+				}
+			};
 
 			<Self as Store>::PendingUpwardMessages::mutate(|up| {
 				let (count, size) = relevant_messaging_state.relay_dispatch_queue_size;
@@ -314,8 +346,8 @@ decl_module! {
 				{
 					Ok(m) => m,
 					Err(_) => {
-						// TODO: #274 This means that there is no such channel anymore. Means that we should
-						// return back the messages from this channel.
+						// TODO: #274 This means that there is no such channel anymore. Means that
+						// we should return back the messages from this channel.
 						//
 						// Until then pretend it became empty
 						prune_empty.push(recipient);
@@ -365,7 +397,7 @@ decl_module! {
 				});
 			}
 
-			// Sort the outbound messages by asceding recipient para id to satisfy the acceptance
+			// Sort the outbound messages by ascending recipient para id to satisfy the acceptance
 			// criteria requirement.
 			outbound_hrmp_messages.sort_by_key(|m| m.recipient);
 
@@ -376,7 +408,7 @@ decl_module! {
 			// This leads to "starvation" of the channels near to the end.
 			//
 			// To mitigate this we shift all processed elements towards the end of the vector using
-			// `rotate_left`. To get intution how it works see the examples in its rustdoc.
+			// `rotate_left`. To get intuition how it works see the examples in its rustdoc.
 			non_empty_hrmp_channels.retain(|x| !prune_empty.contains(x));
 			// `prune_empty.len()` is greater or equal to `outbound_hrmp_num` because the loop above
 			// can only do `outbound_hrmp_num` iterations and `prune_empty` is appended to only inside
@@ -558,7 +590,32 @@ impl<T: Config> Module<T> {
 				.or_insert_with(|| last_mqc_heads.get(&sender).cloned().unwrap_or_default())
 				.extend_hrmp(&horizontal_message);
 
-			T::HrmpMessageHandlers::handle_hrmp_message(sender, horizontal_message);
+			// horizontal_message is actually an AGGREGATE message composed of many FRAGMENTs all
+			// encoded and concatenated together. We must first decode each before dispatching.
+			let sent_at = horizontal_message.sent_at;
+			let mut remaining_fragments = &horizontal_message.data[..];
+			match AggregateFormat::decode(&mut remaining_fragments) {
+				Ok(AggregateFormat::ConcatenatedVersionedXcm) => {
+					while !remaining_fragments.is_empty() {
+						if let Ok(xcm) = VersionedXcm::decode(&mut remaining_fragments) {
+							T::XcmpMessageHandlers::handle_xcm_message(sender, sent_at, xcm);
+						} else {
+							break;
+						}
+					}
+				}
+				Ok(AggregateFormat::ConcatenatedEncodedBlob) => {
+					while !remaining_fragments.is_empty() {
+						if let Ok(blob) = <Vec<u8>>::decode(&mut remaining_fragments) {
+							T::XcmpMessageHandlers::handle_blob_message(sender, sent_at, blob);
+						} else {
+							break;
+						}
+					}
+				}
+				// Can't do much with this aggregate message if we don't know its format.
+				Err(_) => debug_assert!(false, "unknown aggregate format"),
+			}
 		}
 
 		// Check that the MQC heads for each channel provided by the relay chain match the MQC heads
@@ -615,7 +672,7 @@ impl<T: Config> Module<T> {
 		vfp: &PersistedValidationData,
 		cfg: &AbridgedHostConfiguration,
 	) -> Option<relay_chain::BlockNumber> {
-		if PendingValidationFunction::get().is_some() {
+		if PendingRelayChainBlockNumber::get().is_some() {
 			// There is already upgrade scheduled. Upgrade is not allowed.
 			return None;
 		}
@@ -631,8 +688,8 @@ impl<T: Config> Module<T> {
 		Some(vfp.relay_parent_number + cfg.validation_upgrade_delay)
 	}
 
-	/// The implementation of the runtime upgrade scheduling.
-	fn schedule_upgrade_impl(validation_function: Vec<u8>) -> DispatchResult {
+	/// The implementation of the runtime upgrade functionality for parachains.
+	fn set_code_impl(validation_function: Vec<u8>) -> DispatchResult {
 		ensure!(
 			!PendingValidationFunction::exists(),
 			Error::<T>::OverlappingUpgrades
@@ -654,10 +711,19 @@ impl<T: Config> Module<T> {
 		// storage keeps track locally for the parachain upgrade, which will
 		// be applied later.
 		Self::notify_polkadot_of_pending_upgrade(&validation_function);
-		PendingValidationFunction::put((apply_block, validation_function));
+		PendingRelayChainBlockNumber::put(apply_block);
+		PendingValidationFunction::put(validation_function);
 		Self::deposit_event(Event::ValidationFunctionStored(apply_block));
 
 		Ok(())
+	}
+}
+
+pub struct ParachainSetCode<T>(sp_std::marker::PhantomData<T>);
+
+impl<T: Config> frame_system::SetCode for ParachainSetCode<T> {
+	fn set_code(code: Vec<u8>) -> DispatchResult {
+		Module::<T>::set_code_impl(code)
 	}
 }
 
@@ -698,24 +764,8 @@ impl MessageQueueChain {
 	}
 }
 
-/// An error that can be raised upon sending an upward message.
-#[derive(Debug, PartialEq)]
-pub enum SendUpErr {
-	/// The message sent is too big.
-	TooBig,
-}
-
-/// An error that can be raised upon sending a horizontal message.
-#[derive(Debug, PartialEq)]
-pub enum SendHorizontalErr {
-	/// The message sent is too big.
-	TooBig,
-	/// There is no channel to the specified destination.
-	NoChannel,
-}
-
 impl<T: Config> Module<T> {
-	pub fn send_upward_message(message: UpwardMessage) -> Result<(), SendUpErr> {
+	pub fn send_upward_message(message: UpwardMessage) -> Result<u32, MessageSendError> {
 		// Check if the message fits into the relay-chain constraints.
 		//
 		// Note, that we are using `host_configuration` here which may be from the previous
@@ -731,7 +781,7 @@ impl<T: Config> Module<T> {
 		match Self::host_configuration() {
 			Some(cfg) => {
 				if message.len() > cfg.max_upward_message_size as usize {
-					return Err(SendUpErr::TooBig);
+					return Err(MessageSendError::TooBig);
 				}
 			}
 			None => {
@@ -747,11 +797,36 @@ impl<T: Config> Module<T> {
 			}
 		};
 		<Self as Store>::PendingUpwardMessages::append(message);
-		Ok(())
+		Ok(0)
 	}
 
-	pub fn send_hrmp_message(message: OutboundHrmpMessage) -> Result<(), SendHorizontalErr> {
-		let OutboundHrmpMessage { recipient, data } = message;
+	/// Place a message `fragment` on the outgoing XCMP queue for `recipient`.
+	///
+	/// Format is the type of aggregate message that the `fragment` may be safely encoded and
+	/// appended onto. Whether earlier unused space is used for the fragment at the risk of sending
+	/// it out of order is determined with `qos`. NOTE: For any two messages to be guaranteed to be
+	/// dispatched in order, then both must be sent with `ServiceQuality::Ordered`.
+	///
+	/// ## Background
+	///
+	/// For our purposes, one HRMP "message" is actually an aggregated block of XCM "messages".
+	///
+	/// For the sake of clarity, we distinguish between them as message AGGREGATEs versus
+	/// message FRAGMENTs.
+	///
+	/// So each AGGREGATE is comprised af one or more concatenated SCALE-encoded `Vec<u8>`
+	/// FRAGMENTs. Though each fragment is already probably a SCALE-encoded Xcm, we can't be
+	/// certain, so we SCALE encode each `Vec<u8>` fragment in order to ensure we have the
+	/// length prefixed and can thus decode each fragment from the aggregate stream. With this,
+	/// we can concatenate them into a single aggregate blob without needing to be concerned
+	/// about encoding fragment boundaries.
+	fn append_fragment<Fragment: Encode>(
+		recipient: ParaId,
+		format: AggregateFormat,
+		fragment: Fragment,
+		qos: ServiceQuality,
+	) -> Result<u32, MessageSendError> {
+		let data = fragment.encode();
 
 		// First, check if the message is addressed into an opened channel.
 		//
@@ -777,7 +852,7 @@ impl<T: Config> Module<T> {
 				// opened at all so early. At least, relying on this assumption seems to be a better
 				// tradeoff, compared to introducing an error variant that the clients should be
 				// prepared to handle.
-				return Err(SendHorizontalErr::NoChannel);
+				return Err(MessageSendError::NoChannel);
 			}
 		};
 		let channel_meta = match relevant_messaging_state
@@ -785,33 +860,66 @@ impl<T: Config> Module<T> {
 			.binary_search_by_key(&recipient, |(recipient, _)| *recipient)
 		{
 			Ok(idx) => &relevant_messaging_state.egress_channels[idx].1,
-			Err(_) => return Err(SendHorizontalErr::NoChannel),
+			Err(_) => return Err(MessageSendError::NoChannel),
 		};
 		if data.len() as u32 > channel_meta.max_message_size {
-			return Err(SendHorizontalErr::TooBig);
+			return Err(MessageSendError::TooBig);
 		}
 
-		// And then at last update the storage.
-		<Self as Store>::OutboundHrmpMessages::append(&recipient, data);
 		<Self as Store>::NonEmptyHrmpChannels::mutate(|v| {
 			if !v.contains(&recipient) {
 				v.push(recipient);
 			}
 		});
 
-		Ok(())
+		let max_aggregate_size = channel_meta.max_message_size as usize;
+
+		// And then at last update the storage.
+		let preceding = OutboundHrmpMessages::mutate(&recipient, |queue| {
+			if let Some(last_index) = queue.len().checked_sub(1) {
+				let start_index = if let ServiceQuality::Ordered = qos { last_index } else { 0 };
+				for i in start_index ..= last_index {
+					match AggregateFormat::decode(&mut &queue[i][..]) {
+						Ok(f) if f == format => {},
+						_ => continue,
+					}
+					if queue[i].len() + data.len() <= max_aggregate_size {
+						queue[i].extend_from_slice(&data[..]);
+						return i
+					}
+				}
+			}
+			let mut new = format.encode();
+			new.extend_from_slice(&data[..]);
+			queue.push(new);
+			queue.len() - 1
+		});
+
+		Ok(preceding as u32)
 	}
 }
 
 impl<T: Config> UpwardMessageSender for Module<T> {
-	fn send_upward_message(message: UpwardMessage) -> Result<(), ()> {
-		Self::send_upward_message(message).map_err(|_| ())
+	fn send_upward_message(message: UpwardMessage) -> Result<u32, MessageSendError> {
+		Self::send_upward_message(message)
 	}
 }
 
-impl<T: Config> HrmpMessageSender for Module<T> {
-	fn send_hrmp_message(message: OutboundHrmpMessage) -> Result<(), ()> {
-		Self::send_hrmp_message(message).map_err(|_| ())
+impl<T: Config> XcmpMessageSender for Module<T> {
+	fn send_blob_message(
+		recipient: ParaId,
+		blob: Vec<u8>,
+		qos: ServiceQuality,
+	) -> Result<u32, MessageSendError> {
+		Self::append_fragment(recipient, AggregateFormat::ConcatenatedEncodedBlob, blob, qos)
+	}
+
+	fn send_xcm_message(
+		recipient: ParaId,
+		xcm: VersionedXcm,
+		qos: ServiceQuality,
+	) -> Result<u32, MessageSendError> {
+		Self::append_fragment(recipient, AggregateFormat::ConcatenatedVersionedXcm, xcm, qos)
 	}
 }
 
@@ -870,6 +978,8 @@ decl_error! {
 		/// That means that one or more channels had at least some of the submitted messages altered,
 		/// omitted or added illegaly.
 		HrmpMqcMismatch,
+		/// No validation function upgrade is currently scheduled.
+		NotScheduled,
 	}
 }
 
@@ -949,20 +1059,26 @@ mod tests {
 		type BaseCallFilter = ();
 		type SystemWeightInfo = ();
 		type SS58Prefix = ();
+		type OnSetCode = ParachainSetCode<Self>;
 	}
 	impl Config for Test {
 		type Event = Event;
 		type OnValidationData = ();
 		type SelfParaId = ParachainId;
 		type DownwardMessageHandlers = SaveIntoThreadLocal;
-		type HrmpMessageHandlers = SaveIntoThreadLocal;
+		type XcmpMessageHandlers = SaveIntoThreadLocal;
 	}
 
 	pub struct SaveIntoThreadLocal;
+	#[derive(Eq, PartialEq, Clone, Debug)]
+	pub enum HmpMessage {
+		Blob(Vec<u8>),
+		Xcm(xcm::VersionedXcm),
+	}
 
 	std::thread_local! {
 		static HANDLED_DOWNWARD_MESSAGES: RefCell<Vec<InboundDownwardMessage>> = RefCell::new(Vec::new());
-		static HANDLED_HRMP_MESSAGES: RefCell<Vec<(ParaId, InboundHrmpMessage)>> = RefCell::new(Vec::new());
+		static HANDLED_HMP_MESSAGES: RefCell<Vec<(ParaId, relay_chain::BlockNumber, HmpMessage)>> = RefCell::new(Vec::new());
 	}
 
 	impl DownwardMessageHandler for SaveIntoThreadLocal {
@@ -973,10 +1089,15 @@ mod tests {
 		}
 	}
 
-	impl HrmpMessageHandler for SaveIntoThreadLocal {
-		fn handle_hrmp_message(sender: ParaId, msg: InboundHrmpMessage) {
-			HANDLED_HRMP_MESSAGES.with(|m| {
-				m.borrow_mut().push((sender, msg));
+	impl XcmpMessageHandler for SaveIntoThreadLocal {
+		fn handle_blob_message(sender: ParaId, sent_at: relay_chain::BlockNumber, blob: Vec<u8>) {
+			HANDLED_HMP_MESSAGES.with(|m| {
+				m.borrow_mut().push((sender, sent_at, HmpMessage::Blob(blob)));
+			})
+		}
+		fn handle_xcm_message(sender: ParaId, sent_at: relay_chain::BlockNumber, xcm: VersionedXcm) {
+			HANDLED_HMP_MESSAGES.with(|m| {
+				m.borrow_mut().push((sender, sent_at, HmpMessage::Xcm(xcm)));
 			})
 		}
 	}
@@ -985,7 +1106,7 @@ mod tests {
 	// our desired mockup.
 	fn new_test_ext() -> sp_io::TestExternalities {
 		HANDLED_DOWNWARD_MESSAGES.with(|m| m.borrow_mut().clear());
-		HANDLED_HRMP_MESSAGES.with(|m| m.borrow_mut().clear());
+		HANDLED_HMP_MESSAGES.with(|m| m.borrow_mut().clear());
 
 		frame_system::GenesisConfig::default()
 			.build_storage::<Test>()
@@ -1217,26 +1338,6 @@ mod tests {
 	}
 
 	#[test]
-	fn requires_root() {
-		BlockTests::new().add(123, || {
-			assert_eq!(
-				ParachainSystem::schedule_upgrade(Origin::signed(1), Default::default()),
-				Err(sp_runtime::DispatchError::BadOrigin),
-			);
-		});
-	}
-
-	#[test]
-	fn requires_root_2() {
-		BlockTests::new().add(123, || {
-			assert_ok!(ParachainSystem::schedule_upgrade(
-				RawOrigin::Root.into(),
-				Default::default()
-			));
-		});
-	}
-
-	#[test]
 	fn events() {
 		BlockTests::new()
 			.with_relay_sproof_builder(|_, _, builder| {
@@ -1245,7 +1346,7 @@ mod tests {
 			.add_with_post_test(
 				123,
 				|| {
-					assert_ok!(ParachainSystem::schedule_upgrade(
+					assert_ok!(System::set_code(
 						RawOrigin::Root.into(),
 						Default::default()
 					));
@@ -1278,14 +1379,14 @@ mod tests {
 				builder.host_config.validation_upgrade_delay = 1000;
 			})
 			.add(123, || {
-				assert_ok!(ParachainSystem::schedule_upgrade(
+				assert_ok!(System::set_code(
 					RawOrigin::Root.into(),
 					Default::default()
 				));
 			})
 			.add(234, || {
 				assert_eq!(
-					ParachainSystem::schedule_upgrade(RawOrigin::Root.into(), Default::default()),
+					System::set_code(RawOrigin::Root.into(), Default::default()),
 					Err(Error::<Test>::OverlappingUpgrades.into()),
 				)
 			});
@@ -1299,7 +1400,7 @@ mod tests {
 					!PendingValidationFunction::exists(),
 					"validation function must not exist yet"
 				);
-				assert_ok!(ParachainSystem::schedule_upgrade(
+				assert_ok!(System::set_code(
 					RawOrigin::Root.into(),
 					Default::default()
 				));
@@ -1328,7 +1429,7 @@ mod tests {
 			})
 			.add(123, || {
 				assert_eq!(
-					ParachainSystem::schedule_upgrade(RawOrigin::Root.into(), vec![0; 64]),
+					System::set_code(RawOrigin::Root.into(), vec![0; 64]),
 					Err(Error::<Test>::TooBig.into()),
 				);
 			});
@@ -1411,11 +1512,11 @@ mod tests {
 			})
 			.add(1, || {})
 			.add(2, || {
-				assert!(ParachainSystem::send_hrmp_message(OutboundHrmpMessage {
-					recipient: ParaId::from(300),
-					data: b"derp".to_vec(),
-				})
-				.is_err());
+				assert!(ParachainSystem::send_blob_message(
+					ParaId::from(300),
+					b"derp".to_vec(),
+					ServiceQuality::Ordered,
+				).is_err());
 			});
 	}
 
@@ -1443,11 +1544,12 @@ mod tests {
 			.add_with_post_test(
 				1,
 				|| {
-					ParachainSystem::send_hrmp_message(OutboundHrmpMessage {
-						recipient: ParaId::from(300),
-						data: b"derp".to_vec(),
-					})
-					.unwrap()
+					ParachainSystem::send_blob_message(
+						ParaId::from(300),
+						b"derp".to_vec(),
+						ServiceQuality::Ordered,
+					)
+					.unwrap();
 				},
 				|| {
 					// there are no outbound messages since the special logic for handling the
@@ -1467,7 +1569,7 @@ mod tests {
 						v,
 						Some(vec![OutboundHrmpMessage {
 							recipient: ParaId::from(300),
-							data: b"derp".to_vec(),
+							data: (AggregateFormat::ConcatenatedEncodedBlob, &b"derp"[..]).encode(),
 						}])
 					);
 				},
@@ -1546,16 +1648,16 @@ mod tests {
 			.add_with_post_test(
 				1,
 				|| {
-					ParachainSystem::send_hrmp_message(OutboundHrmpMessage {
-						recipient: ParaId::from(300),
-						data: b"1".to_vec(),
-					})
-					.unwrap();
-					ParachainSystem::send_hrmp_message(OutboundHrmpMessage {
-						recipient: ParaId::from(400),
-						data: b"2".to_vec(),
-					})
-					.unwrap()
+					ParachainSystem::send_blob_message(
+						ParaId::from(300),
+						b"1".to_vec(),
+						ServiceQuality::Ordered,
+					).unwrap();
+					ParachainSystem::send_blob_message(
+						ParaId::from(400),
+						b"2".to_vec(),
+						ServiceQuality::Ordered,
+					).unwrap();
 				},
 				|| {},
 			)
@@ -1579,7 +1681,7 @@ mod tests {
 						v,
 						Some(vec![OutboundHrmpMessage {
 							recipient: ParaId::from(300),
-							data: b"1".to_vec(),
+							data: (AggregateFormat::ConcatenatedEncodedBlob, &b"1"[..]).encode(),
 						}])
 					);
 				},
@@ -1660,22 +1762,22 @@ mod tests {
 		lazy_static::lazy_static! {
 			static ref MSG_1: InboundHrmpMessage = InboundHrmpMessage {
 				sent_at: 1,
-				data: b"aquadisco".to_vec(),
+				data: (AggregateFormat::ConcatenatedEncodedBlob, &b"1"[..]).encode(),
 			};
 
 			static ref MSG_2: InboundHrmpMessage = InboundHrmpMessage {
 				sent_at: 1,
-				data: b"mudroom".to_vec(),
+				data: (AggregateFormat::ConcatenatedEncodedBlob, &b"2"[..]).encode(),
 			};
 
 			static ref MSG_3: InboundHrmpMessage = InboundHrmpMessage {
 				sent_at: 2,
-				data: b"eggpeeling".to_vec(),
+				data: (AggregateFormat::ConcatenatedEncodedBlob, &b"3"[..]).encode(),
 			};
 
 			static ref MSG_4: InboundHrmpMessage = InboundHrmpMessage {
 				sent_at: 2,
-				data: b"casino".to_vec(),
+				data: (AggregateFormat::ConcatenatedEncodedBlob, &b"4"[..]).encode(),
 			};
 		}
 
@@ -1731,21 +1833,21 @@ mod tests {
 				_ => unreachable!(),
 			})
 			.add(1, || {
-				HANDLED_HRMP_MESSAGES.with(|m| {
+				HANDLED_HMP_MESSAGES.with(|m| {
 					let mut m = m.borrow_mut();
-					assert_eq!(&*m, &[(ParaId::from(300), MSG_1.clone())]);
+					assert_eq!(&*m, &[(ParaId::from(300), 1, HmpMessage::Blob(b"1".to_vec()))]);
 					m.clear();
 				});
 			})
 			.add(2, || {
-				HANDLED_HRMP_MESSAGES.with(|m| {
+				HANDLED_HMP_MESSAGES.with(|m| {
 					let mut m = m.borrow_mut();
 					assert_eq!(
 						&*m,
 						&[
-							(ParaId::from(300), MSG_2.clone()),
-							(ParaId::from(200), MSG_4.clone()),
-							(ParaId::from(300), MSG_3.clone()),
+							(ParaId::from(300), 1, HmpMessage::Blob(b"2".to_vec())),
+							(ParaId::from(200), 2, HmpMessage::Blob(b"4".to_vec())),
+							(ParaId::from(300), 2, HmpMessage::Blob(b"3".to_vec())),
 						]
 					);
 					m.clear();
@@ -1777,12 +1879,12 @@ mod tests {
 		lazy_static::lazy_static! {
 			static ref MSG_1: InboundHrmpMessage = InboundHrmpMessage {
 				sent_at: 1,
-				data: b"mikhailinvanovich".to_vec(),
+				data: (AggregateFormat::ConcatenatedEncodedBlob, &b"mikhailinvanovich"[..]).encode(),
 			};
 
 			static ref MSG_2: InboundHrmpMessage = InboundHrmpMessage {
 				sent_at: 3,
-				data: b"1000000000".to_vec(),
+				data: (AggregateFormat::ConcatenatedEncodedBlob, &b"1000000000"[..]).encode(),
 			};
 		}
 
@@ -1823,17 +1925,17 @@ mod tests {
 				_ => unreachable!(),
 			})
 			.add(1, || {
-				HANDLED_HRMP_MESSAGES.with(|m| {
+				HANDLED_HMP_MESSAGES.with(|m| {
 					let mut m = m.borrow_mut();
-					assert_eq!(&*m, &[(ALICE, MSG_1.clone())]);
+					assert_eq!(&*m, &[(ALICE, 1, HmpMessage::Blob(b"mikhailinvanovich".to_vec()))]);
 					m.clear();
 				});
 			})
 			.add(2, || {})
 			.add(3, || {
-				HANDLED_HRMP_MESSAGES.with(|m| {
+				HANDLED_HMP_MESSAGES.with(|m| {
 					let mut m = m.borrow_mut();
-					assert_eq!(&*m, &[(ALICE, MSG_2.clone())]);
+					assert_eq!(&*m, &[(ALICE, 3, HmpMessage::Blob(b"1000000000".to_vec()))]);
 					m.clear();
 				});
 			});
