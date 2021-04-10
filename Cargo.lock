@@ -1569,50 +1569,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cumulus-test-parachain-runtime"
-version = "0.1.0"
-dependencies = [
- "cumulus-pallet-parachain-system 0.1.0",
- "cumulus-pallet-xcm-handler 0.1.0",
- "cumulus-primitives-core 0.1.0",
- "cumulus-spambot",
- "frame-executive",
- "frame-support",
- "frame-system",
- "orml-currencies",
- "orml-tokens",
- "orml-traits",
- "orml-unknown-tokens",
- "orml-xcm-support",
- "orml-xtokens",
- "pallet-balances",
- "pallet-randomness-collective-flip",
- "pallet-sudo",
- "pallet-timestamp",
- "pallet-transaction-payment",
- "parachain-info 0.1.0",
- "parity-scale-codec",
- "polkadot-parachain",
- "rococo-parachain-primitives",
- "serde",
- "sp-api",
- "sp-block-builder",
- "sp-core",
- "sp-inherents",
- "sp-io",
- "sp-offchain",
- "sp-runtime",
- "sp-session",
- "sp-std",
- "sp-transaction-pool",
- "sp-version",
- "substrate-wasm-builder 3.0.0",
- "xcm",
- "xcm-builder",
- "xcm-executor",
-]
-
-[[package]]
 name = "cumulus-test-relay-sproof-builder"
 version = "0.1.0"
 dependencies = [
@@ -4196,6 +4152,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b823e83b2affd8f40a9ee8c29dbc56404c1e34cd2710921f2801e2cf29527afa"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "manta-test-parachain-runtime"
+version = "0.1.0"
+dependencies = [
+ "cumulus-pallet-parachain-system 0.1.0",
+ "cumulus-pallet-xcm-handler 0.1.0",
+ "cumulus-primitives-core 0.1.0",
+ "cumulus-spambot",
+ "frame-executive",
+ "frame-support",
+ "frame-system",
+ "orml-currencies",
+ "orml-tokens",
+ "orml-traits",
+ "orml-unknown-tokens",
+ "orml-xcm-support",
+ "orml-xtokens",
+ "pallet-balances",
+ "pallet-randomness-collective-flip",
+ "pallet-sudo",
+ "pallet-timestamp",
+ "pallet-transaction-payment",
+ "parachain-info 0.1.0",
+ "parity-scale-codec",
+ "polkadot-parachain",
+ "rococo-parachain-primitives",
+ "serde",
+ "sp-api",
+ "sp-block-builder",
+ "sp-core",
+ "sp-inherents",
+ "sp-io",
+ "sp-offchain",
+ "sp-runtime",
+ "sp-session",
+ "sp-std",
+ "sp-transaction-pool",
+ "sp-version",
+ "substrate-wasm-builder 3.0.0",
+ "xcm",
+ "xcm-builder",
+ "xcm-executor",
 ]
 
 [[package]]
@@ -7706,13 +7706,13 @@ dependencies = [
  "cumulus-client-network",
  "cumulus-client-service",
  "cumulus-primitives-core 0.1.0",
- "cumulus-test-parachain-runtime",
  "derive_more 0.15.0",
  "exit-future 0.1.4",
  "futures 0.3.13",
  "hex-literal 0.2.1",
  "jsonrpc-core",
  "log",
+ "manta-test-parachain-runtime",
  "nix",
  "pallet-sudo",
  "parity-scale-codec",

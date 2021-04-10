@@ -1,7 +1,7 @@
 [package]
-name = 'cumulus-test-parachain-runtime'
+name = 'manta-test-parachain-runtime'
 version = '0.1.0'
-authors = ["Parity Technologies <admin@parity.io>"]
+authors = ["Manta Network <shumo@manta.network>"]
 edition = '2018'
 
 [dependencies]
@@ -60,12 +60,14 @@ substrate-wasm-builder = "3.0.0"
 default = [ "std" ]
 std = [
 	"codec/std",
+	"serde",
+
 	"orml-currencies/std",
 	"orml-traits/std",
 	"orml-tokens/std",
 	"orml-unknown-tokens/std",
 	"orml-xcm-support/std",
-	"serde",
+	
 	"sp-api/std",
 	"sp-std/std",
 	"sp-io/std",
@@ -77,20 +79,25 @@ std = [
 	"sp-block-builder/std",
 	"sp-transaction-pool/std",
 	"sp-inherents/std",
+
 	"frame-support/std",
 	"frame-executive/std",
 	"frame-system/std",
+
 	"pallet-balances/std",
 	"pallet-randomness-collective-flip/std",
 	"pallet-timestamp/std",
 	"pallet-sudo/std",
 	"pallet-transaction-payment/std",
+
 	"parachain-info/std",
 	"rococo-parachain-primitives/std",
+
 	"cumulus-pallet-parachain-system/std",
 	"cumulus-pallet-xcm-handler/std",
 	"cumulus-primitives-core/std",
 	"cumulus-spambot/std",
+	
 	"xcm/std",
 	"xcm-builder/std",
 	"xcm-executor/std",
