@@ -65,7 +65,7 @@ cumulus-primitives-core = { path = "../primitives/core" }
 
 # Polkadot dependencies
 polkadot-primitives = { git = "https://github.com/paritytech/polkadot", branch = "rococo-v1" }
-polkadot-service = { git = "https://github.com/paritytech/polkadot", branch = "rococo-v1" }
+polkadot-service = { git = "https://github.com/paritytech/polkadot", default-features = false, branch = "rococo-v1" }
 polkadot-cli = { git = "https://github.com/paritytech/polkadot", branch = "rococo-v1" }
 polkadot-test-service = { git = "https://github.com/paritytech/polkadot", branch = "rococo-v1" }
 polkadot-parachain = { git = "https://github.com/paritytech/polkadot", branch = "rococo-v1" }
